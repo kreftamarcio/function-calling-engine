@@ -1,18 +1,23 @@
 /**
  * function-calling-engine: LLM tool-use orchestration.
  *
- * Three concerns, deliberately separate:
- *   DependencyResolver -> what order can these calls run in
- *   ToolExecutor       -> validate, authorize and invoke a single call
- *   RetryPolicy        -> is this failure worth retrying, and is that safe
+ * Four concerns, deliberately separate:
+ *   DependencyResolver   what order can these calls run in
+ *   ToolExecutor         validate, authorize and invoke a single call
+ *   RetryPolicy          is this failure worth retrying, and is that safe
+ *   RepairPromptBuilder  turn a validation failure into a correctable instruction
  *
- * Each is usable standalone. ToolPipeline composes them for the common case:
- * a flat batch of calls from the model where some depend on others' output.
+ * Each is usable standalone. ToolPipeline composes them for the common case: a flat
+ * batch of calls from the model where some depend on others' output.
+ *
+ * Relative imports carry explicit .js extensions because moduleResolution is
+ * NodeNext, which requires them. Omitting them is a compile error, not a style choice.
  */
 
-import { ToolExecutor } from './core/executor';
-import { DependencyResolver } from './planning/dependency-resolver';
-import { ErrorClassifier, RetryPolicy, TerminalError } from './resilience/error-classifier';
+import { ToolExecutor } from './core/executor.js';
+import { DependencyResolver } from './planning/dependency-resolver.js';
+import { ErrorClassifier, RetryPolicy, TerminalError } from './resilience/error-classifier.js';
+import { RepairPromptBuilder } from './validation/repair-prompt.js';
 
 import type {
   ToolDefinition,
@@ -20,28 +25,34 @@ import type {
   ExecutionResult,
   ExecutionContext,
   ExecutorConfig,
-} from './core/executor';
+} from './core/executor.js';
 import type {
   ToolCall,
   CallReference,
   ResolvedNode,
   ExecutionPlan,
-} from './planning/dependency-resolver';
+} from './planning/dependency-resolver.js';
 import {
   CyclicDependencyError,
   UnknownDependencyError,
-} from './planning/dependency-resolver';
+} from './planning/dependency-resolver.js';
 import type {
   ErrorClass,
   ClassifiedError,
   RetryConfig,
-} from './resilience/error-classifier';
+} from './resilience/error-classifier.js';
+import type {
+  FieldIssue,
+  RepairPrompt,
+  RepairPromptConfig,
+} from './validation/repair-prompt.js';
 
 export {
   ToolExecutor,
   DependencyResolver,
   ErrorClassifier,
   RetryPolicy,
+  RepairPromptBuilder,
   TerminalError,
   CyclicDependencyError,
   UnknownDependencyError,
@@ -60,6 +71,9 @@ export type {
   ErrorClass,
   ClassifiedError,
   RetryConfig,
+  FieldIssue,
+  RepairPrompt,
+  RepairPromptConfig,
 };
 
 export const DEFAULT_RETRY_CONFIG: RetryConfig = {
@@ -78,9 +92,9 @@ export interface ToolPipelineConfig {
    */
   declaredDependencies?: Map<string, string[]>;
   /**
-   * Tools safe to repeat after an ambiguous failure. Anything absent is
-   * treated as non-idempotent, which is the safe default: a timeout on an
-   * unknown-idempotency write is reported rather than silently retried.
+   * Tools safe to repeat after an ambiguous failure. Anything absent is treated as
+   * non-idempotent, which is the safe default: a timeout on an unknown-idempotency
+   * write is reported rather than silently retried.
    */
   idempotentTools?: Set<string>;
 }
@@ -122,8 +136,8 @@ export class ToolPipeline {
   }
 
   /**
-   * Plan without executing. Useful for tracing, cost estimation, and asserting
-   * in tests that a batch parallelizes the way you expect.
+   * Plan without executing. Useful for tracing, cost estimation, and asserting in
+   * tests that a batch parallelizes the way you expect.
    */
   plan(calls: ToolCall[]): ExecutionPlan {
     return this.resolver.resolve(calls, this.declared);
@@ -132,16 +146,13 @@ export class ToolPipeline {
   /**
    * Resolve dependencies, then run wave by wave.
    *
-   * Waves run sequentially relative to each other and concurrently within
-   * themselves. When a call fails, its downstream dependents are skipped rather
-   * than executed with a missing argument: passing `undefined` where a real id
-   * was expected produces a confidently wrong result, which is worse than an
-   * explicit skip the model can reason about.
+   * Waves run sequentially relative to each other and concurrently within themselves.
+   * When a call fails, its downstream dependents are skipped rather than executed with
+   * a missing argument: passing `undefined` where a real id was expected produces a
+   * confidently wrong result, which is worse than an explicit skip the model can
+   * reason about.
    */
-  async run(
-    calls: ToolCall[],
-    context: ExecutionContext,
-  ): Promise<PipelineRunResult> {
+  async run(calls: ToolCall[], context: ExecutionContext): Promise<PipelineRunResult> {
     const plan = this.resolver.resolve(calls, this.declared);
 
     const results: ExecutionResult[] = [];
@@ -153,9 +164,12 @@ export class ToolPipeline {
       const runnable: ResolvedNode[] = [];
 
       for (const node of wave) {
-        const brokenDependency = node.dependencies.find(id => failed.has(id));
+        const brokenDependency = node.dependencies.find((id) => failed.has(id));
 
         if (brokenDependency) {
+          // Marked failed too, so anything depending on THIS node is also skipped.
+          // Without the transitive mark, a grandchild would run with a missing
+          // argument from a parent that never ran.
           failed.add(node.call.id);
           skipped.push({
             callId: node.call.id,
@@ -169,12 +183,12 @@ export class ToolPipeline {
       }
 
       const waveResults = await Promise.all(
-        runnable.map(node => this.executeNode(node, context, completed)),
+        runnable.map((node) => this.executeNode(node, context, completed)),
       );
 
       for (let i = 0; i < waveResults.length; i += 1) {
-        const result = waveResults[i];
-        const node = runnable[i];
+        const result = waveResults[i]!;
+        const node = runnable[i]!;
 
         results.push(result);
 
@@ -204,14 +218,20 @@ export class ToolPipeline {
 
     const isIdempotent = this.idempotent.has(node.call.name);
 
+    // Measured here rather than taken from the executor, so the failure path reports
+    // real elapsed time. It previously hardcoded 0, which made a call that timed out
+    // after 30 seconds look instantaneous and skewed every latency percentile in the
+    // direction that hides the problem.
+    const startedAt = performance.now();
+
     try {
-      const { result } = await this.retry.execute(
+      const { result, attempts } = await this.retry.execute(
         async () => {
           const attempt = await this.executor.executeSingle(call, context);
 
-          // The executor reports failure in its return value rather than by
-          // throwing. Rethrow so the retry policy can classify it, but keep
-          // non-retriable failures terminal so they are not attempted again.
+          // The executor reports failure in its return value rather than by throwing.
+          // Rethrow so the retry policy can classify it, but keep non-retriable
+          // failures terminal so they are not attempted again.
           if (!attempt.success) {
             const error = attempt.error;
             if (error && !error.retryable) {
@@ -225,9 +245,14 @@ export class ToolPipeline {
         { idempotent: isIdempotent },
       );
 
-      return result;
+      // Attempts are surfaced because without them a trace cannot distinguish one
+      // slow call from three retried ones.
+      return attempts > 1
+        ? { ...result, metadata: { ...result.metadata, attempts } }
+        : result;
     } catch (error) {
       const classified = (error as { classified?: ClassifiedError }).classified;
+      const attempts = (error as { attempts?: number }).attempts;
 
       return {
         callId: node.call.id,
@@ -238,8 +263,15 @@ export class ToolPipeline {
           message: classified?.message ?? (error as Error).message,
           retryable: classified?.retriable ?? false,
         },
-        latencyMs: 0,
-        metadata: classified ? { errorClass: classified.class } : undefined,
+        latencyMs: Math.round(performance.now() - startedAt),
+        metadata: {
+          ...(classified ? { errorClass: classified.class } : {}),
+          ...(attempts !== undefined ? { attempts } : {}),
+          // Recorded because a non-idempotent failure means the outcome is UNKNOWN
+          // rather than failed, and an operator deciding whether to replay needs
+          // that distinction.
+          idempotent: isIdempotent,
+        },
       };
     }
   }
